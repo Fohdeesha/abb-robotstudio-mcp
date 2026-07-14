@@ -9,6 +9,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
+import { createHash, randomBytes } from "node:crypto";
 
 // ── Configuration ────────────────────────────────────────────
 
@@ -36,9 +37,45 @@ async function bridge(
 
 // ── RWS Client (Robot Web Services REST) ────────────────────
 
-const rwsAuth =
-  "Basic " + Buffer.from(`${RWS_USER}:${RWS_PASS}`).toString("base64");
 let rwsCookie = "";
+
+// ── HTTP Digest auth (IRC5 / RobotWare RWS requires Digest, not Basic) ──
+function md5(s: string): string {
+  return createHash("md5").update(s).digest("hex");
+}
+function parseDigestChallenge(header: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  const re = /(\w+)=(?:"([^"]*)"|([^,\s]+))/g;
+  let m: RegExpExecArray | null;
+  const body = header.replace(/^Digest\s+/i, "");
+  while ((m = re.exec(body)) !== null) {
+    out[m[1].toLowerCase()] = (m[2] ?? m[3] ?? "").trim();
+  }
+  return out;
+}
+let digestNc = 0;
+function buildDigestHeader(method: string, uri: string, c: Record<string, string>): string {
+  const realm = c.realm ?? "";
+  const nonce = c.nonce ?? "";
+  const algorithm = c.algorithm ?? "MD5";
+  const ha1 = md5(`${RWS_USER}:${realm}:${RWS_PASS}`);
+  const ha2 = md5(`${method}:${uri}`);
+  const parts = [
+    `username="${RWS_USER}"`, `realm="${realm}"`, `nonce="${nonce}"`,
+    `uri="${uri}"`, `algorithm=${algorithm}`,
+  ];
+  if (c.qop) {
+    const qop = c.qop.split(",")[0].trim();
+    const nc = (++digestNc).toString(16).padStart(8, "0");
+    const cnonce = randomBytes(8).toString("hex");
+    const response = md5(`${ha1}:${nonce}:${nc}:${cnonce}:${qop}:${ha2}`);
+    parts.push(`qop=${qop}`, `nc=${nc}`, `cnonce="${cnonce}"`, `response="${response}"`);
+  } else {
+    parts.push(`response="${md5(`${ha1}:${nonce}:${ha2}`)}"`);
+  }
+  if (c.opaque) parts.push(`opaque="${c.opaque}"`);
+  return "Digest " + parts.join(", ");
+}
 
 async function rws(
   methodOrPath: string,
@@ -53,25 +90,30 @@ async function rws(
   } else {
     method = "GET"; path = methodOrPath; body = pathOrBody; contentType = bodyOrCt;
   }
-  const headers: Record<string, string> = {
-    Authorization: rwsAuth,
-    Accept: "application/xhtml+xml;v=2.0",
+  const url = `${RWS_URL}${path}`;
+  const baseHeaders: Record<string, string> = { Accept: "application/xhtml+xml;v=2.0" };
+  if (body && contentType) baseHeaders["Content-Type"] = contentType;
+
+  const attempt = async (extra: Record<string, string>) => {
+    const headers: Record<string, string> = { ...baseHeaders, ...extra };
+    if (rwsCookie) headers["Cookie"] = rwsCookie;
+    const res = await fetch(url, { method, headers, body: body ?? null });
+    const setCookie = res.headers.getSetCookie?.() ?? [];
+    for (const c of setCookie) {
+      if (c.includes("ABBCX") || c.includes("-http-session"))
+        rwsCookie = c.split(";")[0] ?? "";
+    }
+    return res;
   };
-  if (rwsCookie) headers["Cookie"] = rwsCookie;
-  if (body && contentType) headers["Content-Type"] = contentType;
 
-  const res = await fetch(`${RWS_URL}${path}`, {
-    method,
-    headers,
-    body: body ?? null,
-  });
-
-  const setCookie = res.headers.getSetCookie();
-  for (const c of setCookie) {
-    if (c.includes("ABBCX") || c.includes("-http-session"))
-      rwsCookie = c.split(";")[0] ?? "";
+  // Try any existing session cookie first; on 401, run the Digest handshake and retry.
+  let res = await attempt({});
+  if (res.status === 401) {
+    const www = res.headers.get("www-authenticate") || "";
+    if (/digest/i.test(www)) {
+      res = await attempt({ Authorization: buildDigestHeader(method, path, parseDigestChallenge(www)) });
+    }
   }
-
   return { status: res.status, body: await res.text() };
 }
 
