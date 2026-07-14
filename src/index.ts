@@ -37,7 +37,15 @@ async function bridge(
 
 // ── RWS Client (Robot Web Services REST) ────────────────────
 
-let rwsCookie = "";
+// The IRC5 issues TWO cookies and needs BOTH replayed: "-http-session-" is the
+// session identifier, ABBCX alone answers 401. Keep them in a jar rather than a
+// single string -- collapsing to one drops the session id, so every request
+// re-runs the Digest handshake and burns one of the controller's 70 sessions
+// ("Cannot add new user. ID is not unique").
+const rwsCookieJar = new Map<string, string>();
+function rwsCookieHeader(): string {
+  return [...rwsCookieJar.values()].join("; ");
+}
 
 // ── HTTP Digest auth (IRC5 / RobotWare RWS requires Digest, not Basic) ──
 function md5(s: string): string {
@@ -96,12 +104,16 @@ async function rws(
 
   const attempt = async (extra: Record<string, string>) => {
     const headers: Record<string, string> = { ...baseHeaders, ...extra };
-    if (rwsCookie) headers["Cookie"] = rwsCookie;
+    const cookie = rwsCookieHeader();
+    if (cookie) headers["Cookie"] = cookie;
     const res = await fetch(url, { method, headers, body: body ?? null });
     const setCookie = res.headers.getSetCookie?.() ?? [];
     for (const c of setCookie) {
-      if (c.includes("ABBCX") || c.includes("-http-session"))
-        rwsCookie = c.split(";")[0] ?? "";
+      const kv = c.split(";")[0] ?? "";
+      const eq = kv.indexOf("=");
+      if (eq <= 0) continue;
+      const name = kv.slice(0, eq);
+      if (name === "ABBCX" || name === "-http-session-") rwsCookieJar.set(name, kv);
     }
     return res;
   };
