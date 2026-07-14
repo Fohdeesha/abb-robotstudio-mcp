@@ -1,22 +1,40 @@
-# Install ClaudeBridge Add-In for RobotStudio 2025
-# Run with: powershell -ExecutionPolicy Bypass -File install-addin.ps1
+# Install the ClaudeBridge Add-In for RobotStudio.
+# Run with:  powershell -ExecutionPolicy Bypass -File install-addin.ps1
+#
+# RobotStudio scans %ProgramFiles(x86)%\Common Files\ABB\RobotStudio\Addins for
+# .rsaddin files at startup (version-independent, all-users). Writing there needs
+# administrator, so this script self-elevates. A third-party (General) add-in with
+# autoLoad="true" is enabled + auto-started automatically on the next RobotStudio
+# launch -- no manual "Load Add-in" step required.
 
-$source = "$PSScriptRoot\addin\bin"
-$dest = "$env:LOCALAPPDATA\ABB\RobotStudio\Addins\ClaudeBridge"
+param([switch]$Elevated)
 
-# Create target directory
-New-Item -ItemType Directory -Path $dest -Force | Out-Null
+$dll     = Join-Path $PSScriptRoot 'addin\bin\ClaudeBridge.dll'
+$rsaddin = Join-Path $PSScriptRoot 'addin\ClaudeBridge.rsaddin'
+$dest    = Join-Path ${env:ProgramFiles(x86)} 'Common Files\ABB\RobotStudio\Addins\ClaudeBridge'
 
-# Copy files
-Copy-Item "$source\ClaudeBridge.dll" $dest -Force
-Copy-Item "$PSScriptRoot\addin\ClaudeBridge.rsaddin" $dest -Force
+if (-not (Test-Path $dll)) {
+    Write-Host "ERROR: $dll not found. Build the add-in first:" -ForegroundColor Red
+    Write-Host '  msbuild addin\ClaudeBridge.csproj /restore /p:Configuration=Release'
+    exit 1
+}
 
-Write-Host "ClaudeBridge Add-In installed to: $dest"
-Write-Host ""
-Write-Host "Next steps:"
-Write-Host "1. Restart RobotStudio"
-Write-Host "2. Open your GoHolo_Simulation station"
-Write-Host "3. The Add-In starts an HTTP server on localhost:58080"
-Write-Host "4. Restart Claude Code - the MCP tools will be available"
-Write-Host ""
-Write-Host "Test: curl http://localhost:58080/ping"
+$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if (-not $isAdmin) {
+    Write-Host "Elevating to write the RobotStudio add-in folder (approve the UAC prompt)..."
+    Start-Process powershell -Verb RunAs -Wait -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$PSCommandPath`"",'-Elevated'
+} else {
+    New-Item -ItemType Directory -Path $dest -Force | Out-Null
+    Copy-Item $dll     $dest -Force
+    Copy-Item $rsaddin $dest -Force
+    Write-Host "ClaudeBridge Add-In installed to: $dest"
+}
+
+if (-not $Elevated) {
+    Write-Host ""
+    Write-Host "Next steps:"
+    Write-Host "1. Restart RobotStudio - the add-in auto-loads and starts an HTTP server on localhost:58080"
+    Write-Host "2. Restart your MCP client (e.g. Claude Code) so the rs_*/rws_* tools attach"
+    Write-Host ""
+    Write-Host "Test: curl http://localhost:58080/ping"
+}
