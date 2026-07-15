@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Net;
 using System.Text;
 using System.Threading;
@@ -24,7 +24,7 @@ namespace ClaudeBridge
         private const int Port = 58080;
         private static readonly Queue<Action> _uiQueue = new Queue<Action>();
 
-        // ── Add-In Entry Point ───────────────────────────────────
+        // â”€â”€ Add-In Entry Point â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
         public static void AddinMain()
         {
@@ -107,7 +107,7 @@ namespace ClaudeBridge
             }
         }
 
-        // ── Request Handler ──────────────────────────────────────
+        // â”€â”€ Request Handler â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
         private void HandleRequest(HttpListenerContext ctx)
         {
@@ -176,12 +176,12 @@ namespace ClaudeBridge
                         stationName = station?.Name ?? "(none)"
                     };
 
-                // ── Station ───────────────────────────────────
+                // â”€â”€ Station â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                 case "/station":              return GetStation();
                 case "/station/objects":      return GetStationObjects();
                 case "/station/save":         return SaveStation();
 
-                // ── RAPID ─────────────────────────────────────
+                // â”€â”€ RAPID â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                 case "/rapid/tasks":          return GetRapidTasks();
                 case "/rapid/modules":        return GetRapidModules(query["task"]);
                 case "/rapid/module/text":
@@ -193,14 +193,14 @@ namespace ClaudeBridge
                         ? GetRapidVariable(query["task"], query["name"])
                         : SetRapidVariable(query["task"], query["name"], body);
 
-                // ── Controller ────────────────────────────────
+                // â”€â”€ Controller â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                 case "/controller/status":    return GetControllerStatus();
                 case "/panel/estop":
                     return SetEmergencyStop(query["state"]);
                 case "/panel/clear_guardstop":
                     return ClearGuardStop(query["motors_on"] != "false");
 
-                // ── Simulation ────────────────────────────────
+                // â”€â”€ Simulation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                 case "/simulation/start":     return StartSimulation();
                 case "/simulation/stop":      return StopSimulation();
                 case "/simulation/pause":     return PauseSimulation();
@@ -209,27 +209,27 @@ namespace ClaudeBridge
                 case "/simulation/speed":
                     return method == "GET" ? GetSimulationSpeed() : SetSimulationSpeed(body);
 
-                // ── Position ──────────────────────────────────
+                // â”€â”€ Position â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                 case "/robot/position":       return GetRobotPosition();
 
-                // ── I/O ───────────────────────────────────────
+                // â”€â”€ I/O â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                 case "/io/signals":           return GetIOSignals();
                 case "/io/signal":
                     return method == "GET"
                         ? GetIOSignal(query["name"])
                         : SetIOSignal(query["name"], body);
 
-                // ── Paths & Targets ───────────────────────────
+                // â”€â”€ Paths & Targets â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                 case "/paths":                return GetPaths();
                 case "/paths/targets":        return GetPathTargets(query["path"]);
                 case "/paths/create":         return CreatePath(body);
                 case "/targets/create":       return CreateTarget(body);
 
-                // ── Config Files ──────────────────────────────
+                // â”€â”€ Config Files â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                 case "/config/read":          return ReadConfigFile(query["name"]);
                 case "/config/write":         return WriteConfigFile(query["name"], body);
 
-                // ── Collision Detection ───────────────────────
+                // â”€â”€ Collision Detection â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                 case "/collision/check":      return CheckCollisions();
 
                 default:
@@ -237,7 +237,7 @@ namespace ClaudeBridge
             }
         }
 
-        // ── Helpers ──────────────────────────────────────────
+        // â”€â”€ Helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
         private Station GetActiveStation()
         {
@@ -317,7 +317,7 @@ namespace ClaudeBridge
             return null;
         }
 
-        // ── Station Endpoints ────────────────────────────────
+        // â”€â”€ Station Endpoints â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
         private object GetStation()
         {
@@ -366,7 +366,7 @@ namespace ClaudeBridge
             return new { success = true, message = $"Station '{station.Name}' saved" };
         }
 
-        // ── RAPID Endpoints ──────────────────────────────────
+        // â”€â”€ RAPID Endpoints â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
         private object GetRapidTasks()
         {
@@ -498,7 +498,7 @@ namespace ClaudeBridge
                         catch { }
                     }
 
-                    // SaveToFile expects a DIRECTORY path — it appends "/<ModuleName>.sysx"
+                    // SaveToFile expects a DIRECTORY path â€” it appends "/<ModuleName>.sysx"
                     step = "SaveToFile to $HOME";
                     module.SaveToFile("$HOME");
 
@@ -601,7 +601,7 @@ namespace ClaudeBridge
             throw new Exception($"Variable '{varName}' not found");
         }
 
-        // ── Controller Status ────────────────────────────────
+        // â”€â”€ Controller Status â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
         private object GetControllerStatus()
         {
@@ -618,7 +618,7 @@ namespace ClaudeBridge
             };
         }
 
-        // ── Virtual panel / guard-stop recovery ──────────────
+        // â”€â”€ Virtual panel / guard-stop recovery â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         //
         // Testing routinely latches the VC into `guardstop` (usually a 50027 "Joint
         // Out of Range" that the controller raises from its VELOCITY PROJECTION long
@@ -648,12 +648,15 @@ namespace ClaudeBridge
 
         // NB: types are fully qualified here on purpose -- a `using System.Reflection`
         // makes `Module` and `Task` ambiguous against ABB.Robotics.Controllers.RapidDomain.
-        private object GetVcPanel(Controller controller)
-        {
-            const System.Reflection.BindingFlags BF = System.Reflection.BindingFlags.Public
-                                                    | System.Reflection.BindingFlags.NonPublic
-                                                    | System.Reflection.BindingFlags.Instance;
+        private const System.Reflection.BindingFlags BF = System.Reflection.BindingFlags.Public
+                                                        | System.Reflection.BindingFlags.NonPublic
+                                                        | System.Reflection.BindingFlags.Instance;
 
+        // Controller -> ControllerInternal -> RobControllerConnection. This one object is
+        // the gateway to both the VC panel board (VcPanel) and the RobApi controller
+        // (Controller -> IRobController.Acknowledge), neither of which is public.
+        private object GetControllerConnection(Controller controller)
+        {
             var ciField = typeof(Controller).GetField("_controller", BF);
             if (ciField == null) throw new Exception("Controller._controller not found (PC SDK layout changed)");
             var ci = ciField.GetValue(controller);
@@ -663,6 +666,12 @@ namespace ClaudeBridge
             if (connProp == null) throw new Exception("ControllerInternal.Connection not found");
             var conn = connProp.GetValue(ci);
             if (conn == null) throw new Exception("ControllerInternal.Connection was null");
+            return conn;
+        }
+
+        private object GetVcPanel(Controller controller)
+        {
+            var conn = GetControllerConnection(controller);
 
             var panelProp = conn.GetType().GetProperty("VcPanel", BF);
             if (panelProp == null) throw new Exception("RobControllerConnection.VcPanel not found");
@@ -725,9 +734,22 @@ namespace ClaudeBridge
                 var panel = GetVcPanel(controller);
                 var steps = new List<string>();
 
-                PanelCall(panel, "SetEmergencyStop", true);
-                Thread.Sleep(1000);
-                steps.Add("estop pressed -> " + controller.State);
+                // Only press if it is not ALREADY pressed. Pressing an already-broken
+                // e-stop circuit raises 90202 "Emergency Stop open" ("...while broken, an
+                // attempt was made to operate the robot"), which then sits unacknowledged
+                // on the pendant -- noise we created ourselves. The latch still needs a
+                // press->release EDGE, so a released e-stop is pressed as before.
+                var alreadyPressed = Equals(PanelCall(panel, "GetEmergencyStop"), true);
+                if (alreadyPressed)
+                {
+                    steps.Add("estop already pressed -> " + controller.State + " (skipped press)");
+                }
+                else
+                {
+                    PanelCall(panel, "SetEmergencyStop", true);
+                    Thread.Sleep(1000);
+                    steps.Add("estop pressed -> " + controller.State);
+                }
 
                 PanelCall(panel, "SetEmergencyStop", false);
                 Thread.Sleep(1000);
@@ -752,7 +774,7 @@ namespace ClaudeBridge
             }
         }
 
-        // ── Simulation Endpoints ─────────────────────────────
+        // â”€â”€ Simulation Endpoints â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
         private object StartSimulation()
         {
@@ -802,7 +824,7 @@ namespace ClaudeBridge
             return new { success = true, message = $"Simulation speed set to {speed}" };
         }
 
-        // ── Position Endpoint ────────────────────────────────
+        // â”€â”€ Position Endpoint â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
         private object GetRobotPosition()
         {
@@ -866,7 +888,7 @@ namespace ClaudeBridge
             return mechanisms;
         }
 
-        // ── I/O Signal Endpoints ─────────────────────────────
+        // â”€â”€ I/O Signal Endpoints â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
         private object GetIOSignals()
         {
@@ -912,7 +934,7 @@ namespace ClaudeBridge
             return new { error = "Direct I/O signal write not yet implemented for this SDK version" };
         }
 
-        // ── Path & Target Endpoints ──────────────────────────
+        // â”€â”€ Path & Target Endpoints â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
         private object GetPaths()
         {
@@ -1019,7 +1041,7 @@ namespace ClaudeBridge
             return new { success = true, message = $"Target '{name}' at ({x}, {y}, {z})" };
         }
 
-        // ── Config File Endpoints ────────────────────────────
+        // â”€â”€ Config File Endpoints â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
         private object ReadConfigFile(string cfgName)
         {
@@ -1056,7 +1078,7 @@ namespace ClaudeBridge
             return new { success = true, message = $"Config file {cfgName} written to {cfgPath}" };
         }
 
-        // ── Collision Detection ──────────────────────────────
+        // â”€â”€ Collision Detection â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
         private object CheckCollisions()
         {
@@ -1073,7 +1095,7 @@ namespace ClaudeBridge
             }
         }
 
-        // ── Reflection Helpers ───────────────────────────────
+        // â”€â”€ Reflection Helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
         private ProjectObject FindObjectByName(ProjectObject parent, string name)
         {
