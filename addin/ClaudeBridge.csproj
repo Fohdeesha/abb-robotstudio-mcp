@@ -30,6 +30,14 @@
       <HintPath>C:\Program Files (x86)\ABB\RobotStudio 2025\Bin\ABB.Robotics.Math.dll</HintPath>
       <Private>false</Private>
     </Reference>
+    <!-- RobApi exposes the VC's simulated panel board (IRobVcPanel.SetEmergencyStop /
+         PressMotorsOn) used by /panel/clear_guardstop. The PC SDK's public
+         VirtualPanel cannot do this: its BeginChangeState routes to the
+         *NoPanelBoardVC internals, which are inert on a VC that has a panel board. -->
+    <Reference Include="RobotStudio.Services.RobApi">
+      <HintPath>C:\Program Files (x86)\ABB\RobotStudio 2025\Bin\RobotStudio.Services.RobApi.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
     <Reference Include="ABB.Robotics.RobotStudio.Environment">
       <HintPath>C:\Program Files (x86)\ABB\RobotStudio 2025\Bin\ABB.Robotics.RobotStudio.Environment.dll</HintPath>
       <Private>false</Private>

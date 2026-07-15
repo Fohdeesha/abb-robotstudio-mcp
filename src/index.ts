@@ -231,6 +231,37 @@ server.tool("rs_controller_status", "Get controller state via SDK (systemState, 
   async () => { try { return ok(await bridge("/controller/status")); } catch (e: any) { return err(e); } }
 );
 
+// ── Virtual panel / guard-stop recovery (VC only) ────────────
+//
+// A latched guard stop (typically 50027 "Joint Out of Range" on J5, raised from the
+// controller's velocity projection well before the joint nears its bound) canNOT be
+// cleared by turning motors on -- RWS ctrl-state=motoron is rejected with
+// SYS_CTRL_E_REJECT (-1073445881). The operator's reset is: press the pendant
+// e-stop, unlatch it, then motors on. These drive RobApi's simulated panel board to
+// do exactly that. Verified live: GuardStop -> EmergencyStop -> EmergencyStopReset
+// -> MotorsOn.
+
+server.tool("rs_clear_guardstop",
+  "Clear a latched guard stop on the VIRTUAL controller by pulsing the virtual pendant e-stop (press -> release -> motors on). Use when controllerState is 'guardstop'; motors-on alone will NOT clear it. VC only.",
+  { motors_on: z.boolean().optional().describe("Press motors-on after releasing the e-stop (default true). False leaves the controller at MotorsOff.") },
+  async ({ motors_on }) => {
+    try {
+      const q = motors_on === false ? "?motors_on=false" : "";
+      return ok(await bridge("/panel/clear_guardstop" + q, "POST"));
+    } catch (e: any) { return err(e); }
+  }
+);
+
+server.tool("rs_set_estop",
+  "Press or release the VIRTUAL pendant emergency stop (VC only). Mostly useful for testing e-stop handling; to recover a guard stop prefer rs_clear_guardstop.",
+  { state: z.enum(["press", "release"]).describe("press = e-stop asserted, release = unlatched") },
+  async ({ state }) => {
+    try {
+      return ok(await bridge(`/panel/estop?state=${state === "press" ? "1" : "0"}`, "POST"));
+    } catch (e: any) { return err(e); }
+  }
+);
+
 server.tool("rs_start_simulation", "Start RobotStudio simulation (Play)", {},
   async () => { try { return ok(await bridge("/simulation/start", "POST")); } catch (e: any) { return err(e); } }
 );

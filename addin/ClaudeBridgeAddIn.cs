@@ -48,14 +48,20 @@ namespace ClaudeBridge
 
         private static void OnIdle(object sender, EventArgs e)
         {
-            lock (_uiQueue)
+            // Dequeue under the lock but run OUTSIDE it. Holding _uiQueue across
+            // action() means one slow or wedged action blocks every RunOnUIThread
+            // caller at the enqueue, so a single bad handler takes the whole add-in
+            // down instead of just timing out its own request.
+            while (true)
             {
-                while (_uiQueue.Count > 0)
+                Action action;
+                lock (_uiQueue)
                 {
-                    var action = _uiQueue.Dequeue();
-                    try { action(); }
-                    catch { /* handled in RunOnUIThread */ }
+                    if (_uiQueue.Count == 0) return;
+                    action = _uiQueue.Dequeue();
                 }
+                try { action(); }
+                catch { /* handled in RunOnUIThread */ }
             }
         }
 
@@ -119,8 +125,18 @@ namespace ClaudeBridge
             int statusCode = 200;
             try
             {
-                result = RunOnUIThread(() =>
-                    Route(path, method, body, ctx.Request.QueryString));
+                // RobApi's virtual-panel calls complete their synchronous wait via a
+                // Windows message pump. Marshalling them onto the UI thread and then
+                // blocking on the returned Task deadlocks that pump permanently: the
+                // call never completes, the UI thread never returns, and because it is
+                // holding the _uiQueue lock every other request starves too (RobotStudio
+                // hangs, /ping included). The standalone Clear-VcGuardStop.ps1 proves
+                // these calls work fine off a plain pumpless thread -- so run them on
+                // the listener's threadpool thread. Only the RobotStudio Station API
+                // has UI-thread affinity; PC SDK / RobApi controller calls do not.
+                result = RequiresUIThread(path)
+                    ? RunOnUIThread(() => Route(path, method, body, ctx.Request.QueryString))
+                    : Route(path, method, body, ctx.Request.QueryString);
             }
             catch (Exception ex)
             {
@@ -135,6 +151,13 @@ namespace ClaudeBridge
             ctx.Response.ContentLength64 = bytes.Length;
             ctx.Response.OutputStream.Write(bytes, 0, bytes.Length);
             ctx.Response.Close();
+        }
+
+        // Paths served purely by PC SDK / RobApi (no RobotStudio Station API access)
+        // must NOT be marshalled to the UI thread -- see the note in HandleRequest.
+        private static bool RequiresUIThread(string path)
+        {
+            return !path.StartsWith("/panel/");
         }
 
         private object Route(string path, string method, string body,
@@ -172,6 +195,10 @@ namespace ClaudeBridge
 
                 // ── Controller ────────────────────────────────
                 case "/controller/status":    return GetControllerStatus();
+                case "/panel/estop":
+                    return SetEmergencyStop(query["state"]);
+                case "/panel/clear_guardstop":
+                    return ClearGuardStop(query["motors_on"] != "false");
 
                 // ── Simulation ────────────────────────────────
                 case "/simulation/start":     return StartSimulation();
@@ -589,6 +616,140 @@ namespace ClaudeBridge
                 simulationState = Simulator.State.ToString(),
                 simulationSpeed = Simulator.SimulationSpeed
             };
+        }
+
+        // ── Virtual panel / guard-stop recovery ──────────────
+        //
+        // Testing routinely latches the VC into `guardstop` (usually a 50027 "Joint
+        // Out of Range" that the controller raises from its VELOCITY PROJECTION long
+        // before the joint is near its bound). Once latched it CANNOT be cleared by
+        // turning motors on: RWS `ctrl-state=motoron` is rejected with icode
+        // -1073445881 (SYS_CTRL_E_REJECT), and so is the MotorOn system input --
+        // both were measured against a live latched guard stop. The safety-chain
+        // feedback signals all read healthy; the LATCH itself needs a reset event.
+        //
+        // The operator's reset is: press the pendant e-stop, unlatch it, then press
+        // motors on. That is reachable on a VIRTUAL controller through RobApi's
+        // simulated panel board:
+        //
+        //     RobControllerConnection.VcPanel -> IRobVcPanel
+        //         .SetEmergencyStop(true)   press
+        //         .SetEmergencyStop(false)  release  -> EmergencyStopReset
+        //         .PressMotorsOn()                   -> MotorsOn
+        //
+        // Verified live: GuardStop -> EmergencyStop -> EmergencyStopReset -> MotorsOn.
+        //
+        // NOTE the PC SDK's VirtualPanel.BeginChangeState(EmergencyStop) does NOT work
+        // here -- it routes to BeginChangeStateNoPanelBoardVC, which is inert because
+        // this VC HAS a panel board (Controller.NoPanelBoard() == false). It fails
+        // silently, so don't "simplify" this to the public VirtualPanel API.
+        //
+        // VcPanel hangs off an internal type, hence the reflection hops.
+
+        // NB: types are fully qualified here on purpose -- a `using System.Reflection`
+        // makes `Module` and `Task` ambiguous against ABB.Robotics.Controllers.RapidDomain.
+        private object GetVcPanel(Controller controller)
+        {
+            const System.Reflection.BindingFlags BF = System.Reflection.BindingFlags.Public
+                                                    | System.Reflection.BindingFlags.NonPublic
+                                                    | System.Reflection.BindingFlags.Instance;
+
+            var ciField = typeof(Controller).GetField("_controller", BF);
+            if (ciField == null) throw new Exception("Controller._controller not found (PC SDK layout changed)");
+            var ci = ciField.GetValue(controller);
+            if (ci == null) throw new Exception("Controller._controller was null");
+
+            var connProp = ci.GetType().GetProperty("Connection", BF);
+            if (connProp == null) throw new Exception("ControllerInternal.Connection not found");
+            var conn = connProp.GetValue(ci);
+            if (conn == null) throw new Exception("ControllerInternal.Connection was null");
+
+            var panelProp = conn.GetType().GetProperty("VcPanel", BF);
+            if (panelProp == null) throw new Exception("RobControllerConnection.VcPanel not found");
+            var panel = panelProp.GetValue(conn);
+            if (panel == null) throw new Exception("VcPanel was null (is this controller virtual?)");
+            return panel;
+        }
+
+        // Invoke an IRobVcPanel method that returns a Task / Task<T> and wait for it.
+        private object PanelCall(object panel, string method, params object[] args)
+        {
+            var types = args.Select(a => a.GetType()).ToArray();
+            var mi = panel.GetType().GetMethod(method, types);
+            if (mi == null) throw new Exception("IRobVcPanel." + method + " not found");
+            var task = mi.Invoke(panel, args) as System.Threading.Tasks.Task;
+            if (task == null) return null;
+            task.Wait(20000);
+            if (task.IsFaulted && task.Exception != null) throw task.Exception.GetBaseException();
+            var rt = task.GetType();
+            if (rt.IsGenericType)
+            {
+                var rp = rt.GetProperty("Result");
+                if (rp != null) return rp.GetValue(task);
+            }
+            return null;
+        }
+
+        private void AssertVirtual(Controller controller)
+        {
+            if (!controller.IsVirtual)
+                throw new Exception("Refusing: controller is NOT virtual. This endpoint is VC-only.");
+        }
+
+        private object SetEmergencyStop(string state)
+        {
+            bool press = !(state == "0" || string.Equals(state, "false", StringComparison.OrdinalIgnoreCase) ||
+                           string.Equals(state, "release", StringComparison.OrdinalIgnoreCase));
+            using (var controller = ConnectToController())
+            {
+                AssertVirtual(controller);
+                var panel = GetVcPanel(controller);
+                PanelCall(panel, "SetEmergencyStop", press);
+                Thread.Sleep(1000);
+                return new
+                {
+                    success = true,
+                    action = press ? "estop pressed" : "estop released",
+                    controllerState = controller.State.ToString(),
+                    operatingMode = controller.OperatingMode.ToString()
+                };
+            }
+        }
+
+        private object ClearGuardStop(bool motorsOn)
+        {
+            using (var controller = ConnectToController())
+            {
+                AssertVirtual(controller);
+                var before = controller.State.ToString();
+                var panel = GetVcPanel(controller);
+                var steps = new List<string>();
+
+                PanelCall(panel, "SetEmergencyStop", true);
+                Thread.Sleep(1000);
+                steps.Add("estop pressed -> " + controller.State);
+
+                PanelCall(panel, "SetEmergencyStop", false);
+                Thread.Sleep(1000);
+                steps.Add("estop released -> " + controller.State);
+
+                if (motorsOn)
+                {
+                    PanelCall(panel, "PressMotorsOn");
+                    Thread.Sleep(1500);
+                    steps.Add("motors on pressed -> " + controller.State);
+                }
+
+                var after = controller.State.ToString();
+                return new
+                {
+                    success = !string.Equals(after, "GuardStop", StringComparison.OrdinalIgnoreCase),
+                    before,
+                    after,
+                    operatingMode = controller.OperatingMode.ToString(),
+                    steps
+                };
+            }
         }
 
         // ── Simulation Endpoints ─────────────────────────────
