@@ -47,6 +47,66 @@ function rwsCookieHeader(): string {
   return [...rwsCookieJar.values()].join("; ");
 }
 
+// ── RWS API version (IRC5/RWS1.0 vs OmniCore/RWS2.0) ─────────
+// IRC5 (RobotWare 6) speaks RWS 1.0: Accept "application/xhtml+xml" (no version
+// param) and I/O set via ".../{signal}?action=set". OmniCore (RobotWare 7)
+// speaks RWS 2.0: Accept "application/xhtml+xml;v=2.0" and I/O set via
+// ".../{signal}/set-value". Sending the versioned media type to a strict IRC5
+// yields HTTP 406 ("Server cannot generate response for given accept header").
+// We detect ONCE (cached) and adapt. Detection keys off the RobotWare MAJOR
+// version (RW7+ => v2, RW6/lower => v1) because some IRC5 firmware/VCs leniently
+// 2xx the versioned Accept -- the controller GENERATION is the reliable signal,
+// not its content-negotiation strictness.
+const RWS_ACCEPT_V1 = "application/xhtml+xml";
+const RWS_ACCEPT_V2 = "application/xhtml+xml;v=2.0";
+let rwsApiVersion: "v1" | "v2" | null = null;
+let rwsReadyPromise: Promise<void> | null = null;
+
+function rwsAccept(): string {
+  return rwsApiVersion === "v2" ? RWS_ACCEPT_V2 : RWS_ACCEPT_V1;
+}
+
+// Single-flight readiness gate: the FIRST RWS call runs one serial probe that
+// detects the API version AND completes the Digest handshake / seeds the
+// session cookie. Every later call (including the concurrent Promise.all bursts
+// in rws_controller_status / rws_get_position) then reuses that warm cookie,
+// instead of each racing its own Digest handshake and minting a throwaway
+// session on the controller (the 70-session cap / "ID is not unique" trap).
+function ensureRwsReady(): Promise<void> {
+  if (rwsApiVersion) return Promise.resolve();
+  if (!rwsReadyPromise) {
+    rwsReadyPromise = detectApiVersion().catch((e) => {
+      rwsReadyPromise = null; // allow re-detection on the next call
+      throw e;
+    });
+  }
+  return rwsReadyPromise;
+}
+
+async function detectApiVersion(): Promise<void> {
+  // Probe /rw/system with the v2 Accept. OmniCore answers 2xx; a strict IRC5
+  // answers 406. Read the RobotWare version to decide by generation.
+  let probe = await rwsRaw("GET", "/rw/system", undefined, undefined, RWS_ACCEPT_V2);
+  let rwver = rwsExtract(probe.body, "rwversion");
+  if (!rwver && probe.status === 406) {
+    // Strict IRC5 rejected the versioned media type; re-read with the v1 Accept
+    // to recover the version string (and confirm reachability).
+    probe = await rwsRaw("GET", "/rw/system", undefined, undefined, RWS_ACCEPT_V1);
+    rwver = rwsExtract(probe.body, "rwversion");
+  }
+  const major = parseInt((rwver.split(".")[0] || "").trim(), 10);
+  if (Number.isFinite(major) && major >= 7) rwsApiVersion = "v2";
+  else if (Number.isFinite(major) && major >= 1) rwsApiVersion = "v1";
+  else rwsApiVersion = probe.status >= 200 && probe.status < 300 ? "v2" : "v1";
+  console.error(
+    `RWS API: ${rwsApiVersion}${rwver ? ` (RobotWare ${rwver})` : ""} @ ${RWS_URL}`
+  );
+}
+
+function rwsOk(status: number): boolean {
+  return status >= 200 && status < 300;
+}
+
 // ── HTTP Digest auth (IRC5 / RobotWare RWS requires Digest, not Basic) ──
 function md5(s: string): string {
   return createHash("md5").update(s).digest("hex");
@@ -85,21 +145,17 @@ function buildDigestHeader(method: string, uri: string, c: Record<string, string
   return "Digest " + parts.join(", ");
 }
 
-async function rws(
-  methodOrPath: string,
-  pathOrBody?: string,
-  bodyOrCt?: string,
-  ct?: string
+// Low-level request: explicit Accept header, no version-readiness gate (the
+// detector calls this directly). Handles the cookie jar + Digest handshake.
+async function rwsRaw(
+  method: string,
+  path: string,
+  body: string | undefined,
+  contentType: string | undefined,
+  accept: string
 ): Promise<{ status: number; body: string }> {
-  // Support both rws("/path") and rws("POST", "/path", body, ct)
-  let method: string, path: string, body: string | undefined, contentType: string | undefined;
-  if (methodOrPath === "GET" || methodOrPath === "POST" || methodOrPath === "PUT") {
-    method = methodOrPath; path = pathOrBody!; body = bodyOrCt; contentType = ct;
-  } else {
-    method = "GET"; path = methodOrPath; body = pathOrBody; contentType = bodyOrCt;
-  }
   const url = `${RWS_URL}${path}`;
-  const baseHeaders: Record<string, string> = { Accept: "application/xhtml+xml;v=2.0" };
+  const baseHeaders: Record<string, string> = { Accept: accept };
   if (body && contentType) baseHeaders["Content-Type"] = contentType;
 
   const attempt = async (extra: Record<string, string>) => {
@@ -127,6 +183,23 @@ async function rws(
     }
   }
   return { status: res.status, body: await res.text() };
+}
+
+async function rws(
+  methodOrPath: string,
+  pathOrBody?: string,
+  bodyOrCt?: string,
+  ct?: string
+): Promise<{ status: number; body: string }> {
+  // Support both rws("/path") and rws("POST", "/path", body, ct)
+  let method: string, path: string, body: string | undefined, contentType: string | undefined;
+  if (methodOrPath === "GET" || methodOrPath === "POST" || methodOrPath === "PUT") {
+    method = methodOrPath; path = pathOrBody!; body = bodyOrCt; contentType = ct;
+  } else {
+    method = "GET"; path = methodOrPath; body = pathOrBody; contentType = bodyOrCt;
+  }
+  await ensureRwsReady();
+  return rwsRaw(method, path, body, contentType, rwsAccept());
 }
 
 function rwsExtract(xml: string, tag: string): string {
@@ -371,7 +444,7 @@ server.tool("rws_set_motors", "Turn motors on/off via RWS (real controller comma
   async ({ state }) => { try {
     const r = await rws("POST","/rw/panel/ctrlstate?action=setctrlstate",
       `ctrl-state=motor${state}`, "application/x-www-form-urlencoded");
-    return ok({ result: r.status === 204 ? `Motors ${state}` : r.body });
+    return ok({ result: rwsOk(r.status) ? `Motors ${state}` : r.body });
   } catch (e: any) { return err(e); } }
 );
 
@@ -383,7 +456,7 @@ server.tool("rws_start_program", "Start RAPID execution on the controller via RW
     const r = await rws("POST","/rw/rapid/execution?action=start",
       `regain=continue&execmode=${mode || "continue"}&cycle=forever&condition=none&stopatbp=disabled&alltaskbytsp=false`,
       "application/x-www-form-urlencoded");
-    return ok({ result: r.status === 204 ? "Program started" : r.body });
+    return ok({ result: rwsOk(r.status) ? "Program started" : r.body });
   } catch (e: any) { return err(e); } }
 );
 
@@ -391,14 +464,14 @@ server.tool("rws_stop_program", "Stop RAPID execution via RWS", {},
   async () => { try {
     const r = await rws("POST","/rw/rapid/execution?action=stop",
       "stopmode=stop&usetsp=normal", "application/x-www-form-urlencoded");
-    return ok({ result: r.status === 204 ? "Program stopped" : r.body });
+    return ok({ result: rwsOk(r.status) ? "Program stopped" : r.body });
   } catch (e: any) { return err(e); } }
 );
 
 server.tool("rws_reset_pp", "Reset RAPID program pointer via RWS", {},
   async () => { try {
     const r = await rws("POST","/rw/rapid/execution?action=resetpp");
-    return ok({ result: r.status === 204 ? "PP reset" : r.body });
+    return ok({ result: rwsOk(r.status) ? "PP reset" : r.body });
   } catch (e: any) { return err(e); } }
 );
 
@@ -447,7 +520,7 @@ server.tool("rws_write_module", "Write RAPID module text via RWS (auto-mastershi
       const r = await rws("POST",
         `/rw/rapid/tasks/${task}/modules/${module}/text?action=set`,
         `module-text=${encodeURIComponent(code)}`, "application/x-www-form-urlencoded");
-      return ok({ result: r.status === 204 ? `Module ${module} updated` : r.body });
+      return ok({ result: rwsOk(r.status) ? `Module ${module} updated` : r.body });
     } finally { await rws("POST","/rw/mastership/rapid?action=release").catch(() => {}); }
   } catch (e: any) { return err(e); } }
 );
@@ -470,7 +543,7 @@ server.tool("rws_write_variable", "Write a RAPID variable's live value via RWS",
       const r = await rws("POST",
         `/rw/rapid/symbol/RAPID/${task}/${module}/${variable}/data?action=set`,
         `value=${encodeURIComponent(value)}`, "application/x-www-form-urlencoded");
-      return ok({ result: r.status === 204 ? `${variable} = ${value}` : r.body });
+      return ok({ result: rwsOk(r.status) ? `${variable} = ${value}` : r.body });
     } finally { await rws("POST","/rw/mastership/rapid?action=release").catch(() => {}); }
   } catch (e: any) { return err(e); } }
 );
@@ -519,9 +592,14 @@ server.tool("rws_read_io", "Read a single I/O signal via RWS",
 server.tool("rws_write_io", "Set an I/O signal value via RWS",
   { signal: z.string(), value: z.number() },
   async ({ signal, value }) => { try {
-    const r = await rws("POST",`/rw/iosystem/signals/${signal}/set-value`,
-      `lvalue=${value}`, "application/x-www-form-urlencoded;v=2.0");
-    return ok({ result: r.status === 204 ? `${signal} = ${value}` : r.body });
+    await ensureRwsReady();
+    // v1/IRC5: "?action=set"; v2/OmniCore: "/set-value". Accept header (carried
+    // by rws()) selects the API version; the endpoint PATH differs too.
+    const path = rwsApiVersion === "v2"
+      ? `/rw/iosystem/signals/${signal}/set-value`
+      : `/rw/iosystem/signals/${signal}?action=set`;
+    const r = await rws("POST", path, `lvalue=${value}`, "application/x-www-form-urlencoded");
+    return ok({ result: rwsOk(r.status) ? `${signal} = ${value}` : r.body });
   } catch (e: any) { return err(e); } }
 );
 
@@ -539,7 +617,7 @@ server.tool("rws_set_speed_override", "Set speed override (0-100%) via RWS",
   async ({ speed }) => { try {
     const r = await rws("POST","/rw/panel/speedratio?action=setspeedratio",
       `speed-ratio=${speed}`, "application/x-www-form-urlencoded");
-    return ok({ result: r.status === 204 ? `Speed ${speed}%` : r.body });
+    return ok({ result: rwsOk(r.status) ? `Speed ${speed}%` : r.body });
   } catch (e: any) { return err(e); } }
 );
 
@@ -575,17 +653,22 @@ server.tool("rws_write_file", "Write a file to controller filesystem via RWS",
   { path: z.string(), content: z.string() },
   async ({ path, content }) => { try {
     const r = await rws("PUT", `/fileservice/${encodeURIComponent(path)}`, content, "text/plain");
-    return ok({ result: r.status <= 204 ? `Written to ${path}` : r.body });
+    return ok({ result: rwsOk(r.status) ? `Written to ${path}` : r.body });
   } catch (e: any) { return err(e); } }
 );
 
 // ── Mastership (RWS) ────────────────────────────────────────
+// NOTE: these use the RWS 1.0 domain paths (/rw/mastership/{rapid,cfg,motion}),
+// verified against IRC5. OmniCore/RWS 2.0 reworked mastership (e.g. an "edit"
+// mastership model); the v2 forms are UNVERIFIED here (no OmniCore hardware to
+// test against), so on an OmniCore controller mastership-gated writes may need
+// path updates. Left as-is rather than changed blind.
 
 server.tool("rws_request_mastership", "Request mastership (needed for writes)",
   { domain: z.enum(["rapid", "cfg", "motion"]).optional() },
   async ({ domain }) => { try {
     const r = await rws("POST",`/rw/mastership/${domain || "rapid"}?action=request`);
-    return ok({ result: r.status === 204 ? "Mastership acquired" : r.body });
+    return ok({ result: rwsOk(r.status) ? "Mastership acquired" : r.body });
   } catch (e: any) { return err(e); } }
 );
 
@@ -593,7 +676,7 @@ server.tool("rws_release_mastership", "Release mastership",
   { domain: z.enum(["rapid", "cfg", "motion"]).optional() },
   async ({ domain }) => { try {
     const r = await rws("POST",`/rw/mastership/${domain || "rapid"}?action=release`);
-    return ok({ result: r.status === 204 ? "Mastership released" : r.body });
+    return ok({ result: rwsOk(r.status) ? "Mastership released" : r.body });
   } catch (e: any) { return err(e); } }
 );
 
