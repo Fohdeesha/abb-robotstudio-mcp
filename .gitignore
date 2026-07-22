@@ -7,6 +7,7 @@ dist/
 # C# / Add-In build artifacts
 addin/bin/
 addin/obj/
+*.rspak
 *.user
 *.suo
 .vs/

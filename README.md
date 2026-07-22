@@ -20,13 +20,45 @@ npm run build
 
 ### Add-In (only needed for `rs_*` tools)
 
+**Recommended: install the `.rspak` distribution package** — the native RobotStudio
+add-in package format. Per-user install, no admin rights, no copying files around:
+
+1. Get `Fohdeesha.ClaudeBridge-<version>.rspak` (from a release, or build it yourself — below).
+2. In RobotStudio: **Add-Ins tab → Install Package** → select the `.rspak`.
+3. Restart RobotStudio. The add-in auto-loads and opens an HTTP listener at `http://localhost:58080`.
+
+Verify with `curl http://localhost:58080/ping` — the response includes the loaded
+add-in version and assembly location.
+
+To build the package yourself (needs the .NET SDK or MSBuild, plus the free
+[RobotStudio SDK](https://developercenter.robotstudio.com) for its `RspakTool.exe`):
+
+```powershell
+./build-rspak.ps1
+```
+
+This compiles `addin/ClaudeBridge.csproj` and emits `Fohdeesha.ClaudeBridge-<version>.rspak`
+in the repo root (spec: `addin/ClaudeBridge.rspakspec`).
+
+<details>
+<summary>Developer copy-install (legacy alternative)</summary>
+
 Build `addin/ClaudeBridge.csproj` against your RobotStudio SDK (RobotStudio 2024+), then:
 
 ```powershell
 ./install-addin.ps1
 ```
 
-This copies the compiled add-in into RobotStudio's add-in folder. On the next RobotStudio start, an HTTP listener comes up at `http://localhost:58080`.
+This copies the compiled add-in into RobotStudio's all-users add-in folder
+(`%ProgramFiles(x86)%\Common Files\ABB\RobotStudio\Addins`, needs admin — the
+script self-elevates). Useful for quick dev iteration without repackaging.
+
+Note: an installed `.rspak` package **shadows** this copy (RobotStudio scans
+`%LocalAppData%\ABB\DistributionPackages2` first and loads only the first add-in
+with a given `ApplicationId`). Uninstall the package from the Add-Ins tab first
+if you want the copy-installed DLL to load; `install-addin.ps1` warns when it
+detects this.
+</details>
 
 ## Configure your MCP client
 

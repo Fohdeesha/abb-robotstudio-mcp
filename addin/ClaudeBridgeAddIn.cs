@@ -167,11 +167,14 @@ namespace ClaudeBridge
             {
                 case "/ping":
                     var station = Station.ActiveStation;
+                    var asm = System.Reflection.Assembly.GetExecutingAssembly();
                     return new
                     {
                         status = "ok",
                         server = "ClaudeBridge",
                         port = Port,
+                        version = asm.GetName().Version.ToString(),
+                        assemblyLocation = asm.Location,
                         stationOpen = station != null,
                         stationName = station?.Name ?? "(none)"
                     };
