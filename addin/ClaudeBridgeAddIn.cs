@@ -193,7 +193,7 @@ namespace ClaudeBridge
                         : SetModuleText(query["task"], query["module"], body);
                 case "/rapid/variable":
                     return method == "GET"
-                        ? GetRapidVariable(query["task"], query["name"])
+                        ? GetRapidVariable(query["task"], query["name"], query["module"])
                         : SetRapidVariable(query["task"], query["name"], body);
 
                 // â”€â”€ Controller â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -262,7 +262,14 @@ namespace ClaudeBridge
             var rsCtrl = GetController();
             var scanner = new NetworkScanner();
             scanner.Scan();
+            return ConnectTo(rsCtrl, scanner);
+        }
 
+        // Connect (PC SDK) to the VC behind one specific station controller. The
+        // scanner is passed in so multi-controller callers (GetRobotPosition)
+        // scan ONCE and connect to each.
+        private Controller ConnectTo(RsIrc5Controller rsCtrl, NetworkScanner scanner)
+        {
             // Try by SystemId first, then fall back to matching by name
             ControllerInfo ctrlInfo = null;
             try
@@ -445,75 +452,126 @@ namespace ClaudeBridge
 
                     if (!isSystem)
                     {
-                        // Program module: save program, then download the file
-                        step = "SaveProgramToFile";
+                        // Program module: save program, then download the file.
+                        // The WHOLE strategy is best-effort (measured 2026-08-04):
+                        // after a raw RWS loadprog the task's ProgramName is empty
+                        // and SaveProgramToFile "succeeds" while writing NOTHING,
+                        // then listing the empty dir throws a bare Exception --
+                        // which used to abort the whole handler instead of letting
+                        // the generic module.SaveToFile fallback below run.
                         var remoteDir = "$HOME/_claude_tmp_prog";
-                        task.SaveProgramToFile(remoteDir);
-
-                        step = "FindInSavedProgram";
-                        var files = controller.FileSystem.GetFilesAndDirectories(remoteDir + "/*");
-                        string foundRemote = null;
-                        foreach (var f in files)
-                        {
-                            var fname = Path.GetFileNameWithoutExtension(f.Name);
-                            if (fname.Equals(moduleName, StringComparison.OrdinalIgnoreCase))
-                            {
-                                foundRemote = remoteDir + "/" + f.Name;
-                                break;
-                            }
-                        }
-
-                        if (foundRemote != null)
-                        {
-                            step = $"GetFile({foundRemote})";
-                            controller.FileSystem.GetFile(foundRemote, localFile, true);
-                            string text = File.ReadAllText(localFile);
-                            try { controller.FileSystem.RemoveDirectory(remoteDir, true); } catch { }
-                            try { File.Delete(localFile); } catch { }
-                            return new { task = taskName, module = moduleName, type = "program", text };
-                        }
-                        try { controller.FileSystem.RemoveDirectory(remoteDir, true); } catch { }
-                    }
-
-                    // System module or not found in program: search controller filesystem
-                    step = "SearchSystemModule";
-                    string[] searchDirs = { "$HOME", "$SYSTEM", "$SYSTEM/RAPID" };
-                    string[] extensions = { ".sys", ".sysx", ".mod", ".modx" };
-
-                    foreach (var dir in searchDirs)
-                    {
                         try
                         {
-                            var files = controller.FileSystem.GetFilesAndDirectories(dir + "/*");
+                            step = "SaveProgramToFile";
+                            task.SaveProgramToFile(remoteDir);
+
+                            step = "FindInSavedProgram";
+                            var files = controller.FileSystem.GetFilesAndDirectories(remoteDir + "/*");
+                            string foundRemote = null;
                             foreach (var f in files)
                             {
                                 var fname = Path.GetFileNameWithoutExtension(f.Name);
                                 if (fname.Equals(moduleName, StringComparison.OrdinalIgnoreCase))
                                 {
-                                    step = $"GetFile({dir}/{f.Name})";
-                                    controller.FileSystem.GetFile(dir + "/" + f.Name, localFile, true);
-                                    string text = File.ReadAllText(localFile);
-                                    try { File.Delete(localFile); } catch { }
-                                    return new { task = taskName, module = moduleName, type = "system", text };
+                                    foundRemote = remoteDir + "/" + f.Name;
+                                    break;
                                 }
                             }
+
+                            if (foundRemote != null)
+                            {
+                                step = $"GetFile({foundRemote})";
+                                controller.FileSystem.GetFile(foundRemote, localFile, true);
+                                string text = File.ReadAllText(localFile);
+                                try { controller.FileSystem.RemoveDirectory(remoteDir, true); } catch { }
+                                try { File.Delete(localFile); } catch { }
+                                return new { task = taskName, module = moduleName, type = "program", text };
+                            }
+                        }
+                        catch { /* fall through to the generic strategies below */ }
+                        finally
+                        {
+                            try { controller.FileSystem.RemoveDirectory(remoteDir, true); } catch { }
+                        }
+                    }
+
+                    // System modules: search the controller filesystem's known
+                    // locations first (user/BASE etc. live there). Deliberately
+                    // NOT done for program modules -- a stale same-named file in
+                    // $HOME would shadow the LIVE loaded text.
+                    if (isSystem)
+                    {
+                        step = "SearchSystemModule";
+                        string[] searchDirs = { "$HOME", "$SYSTEM", "$SYSTEM/RAPID" };
+
+                        foreach (var dir in searchDirs)
+                        {
+                            try
+                            {
+                                var files = controller.FileSystem.GetFilesAndDirectories(dir + "/*");
+                                foreach (var f in files)
+                                {
+                                    var fname = Path.GetFileNameWithoutExtension(f.Name);
+                                    if (fname.Equals(moduleName, StringComparison.OrdinalIgnoreCase))
+                                    {
+                                        step = $"GetFile({dir}/{f.Name})";
+                                        controller.FileSystem.GetFile(dir + "/" + f.Name, localFile, true);
+                                        string text = File.ReadAllText(localFile);
+                                        try { File.Delete(localFile); } catch { }
+                                        return new { task = taskName, module = moduleName, type = "system", text };
+                                    }
+                                }
+                            }
+                            catch { }
+                        }
+                    }
+
+                    // Generic last resort, works for ANY loaded module. SaveToFile
+                    // takes a DIRECTORY and appends "/<ModuleName>.<ext>" (.sysx
+                    // system / .modx program; older firmware .sys/.mod). Per the
+                    // PC SDK doc: virtual controllers accept ABSOLUTE PC paths;
+                    // real controllers accept controller paths (env-var syntax is
+                    // "(HOME$)", NOT "$HOME" -- the old "$HOME" arg silently
+                    // saved nothing, measured 2026-08-04).
+                    string[] saveExts = { ".sysx", ".modx", ".sys", ".mod" };
+                    string moduleTypeStr = isSystem ? "system" : "program";
+
+                    // Strategy A (virtual controllers): save straight into the
+                    // local temp dir on this PC.
+                    step = "SaveToFile to local dir";
+                    try
+                    {
+                        module.SaveToFile(localDir);
+                        foreach (var ext in saveExts)
+                        {
+                            var savedLocal = Path.Combine(localDir, moduleName + ext);
+                            if (!File.Exists(savedLocal)) continue;
+                            string text = File.ReadAllText(savedLocal);
+                            try { File.Delete(savedLocal); } catch { }
+                            return new { task = taskName, module = moduleName, type = moduleTypeStr, text };
+                        }
+                    }
+                    catch { /* real controller: PC paths unsupported; fall through */ }
+
+                    // Strategy B (real controllers): save to the controller's HOME
+                    // and download via the controller filesystem.
+                    step = "SaveToFile to (HOME$)";
+                    module.SaveToFile("(HOME$)");
+                    foreach (var ext in saveExts)
+                    {
+                        try
+                        {
+                            step = $"GetFile $HOME/{moduleName}{ext}";
+                            controller.FileSystem.GetFile("$HOME/" + moduleName + ext, localFile, true);
+                            string text = File.ReadAllText(localFile);
+                            try { File.Delete(localFile); } catch { }
+                            try { controller.FileSystem.RemoveFile("$HOME/" + moduleName + ext); } catch { }
+                            return new { task = taskName, module = moduleName, type = moduleTypeStr, text };
                         }
                         catch { }
                     }
-
-                    // SaveToFile expects a DIRECTORY path â€” it appends "/<ModuleName>.sysx"
-                    step = "SaveToFile to $HOME";
-                    module.SaveToFile("$HOME");
-
-                    // Read directly from VC disk path
-                    step = "ReadFromDisk";
-                    var rsCtrl = GetController();
-                    var savedFile = Path.Combine(rsCtrl.SystemPath, "HOME", moduleName + ".sysx");
-                    if (!File.Exists(savedFile))
-                        throw new Exception($"SaveToFile succeeded but file not found at: {savedFile}");
-                    string sysText = File.ReadAllText(savedFile);
-                    try { File.Delete(savedFile); } catch { }
-                    return new { task = taskName, module = moduleName, type = "system", text = sysText };
+                    throw new Exception(
+                        $"SaveToFile produced no readable {moduleName}.(sysx|modx|sys|mod) locally or in the controller HOME");
                 }
             }
             catch (Exception ex)
@@ -555,12 +613,79 @@ namespace ClaudeBridge
             }
         }
 
-        private object GetRapidVariable(string taskName, string varName)
+        // Read a RAPID data object's LIVE value from the controller via the PC SDK
+        // (RapidData.StringValue). The pre-2.2.0 implementation read the STATION's
+        // RsDataDeclaration.InitialExpression, which is null for controller-synced
+        // data -- so the tool returned metadata with no value since day one. The
+        // station read survives as the explicit fallback when the controller is
+        // unreachable (a stopped VC still has declarations worth seeing), tagged
+        // with `source` so the caller always knows which one it got.
+        private object GetRapidVariable(string taskName, string varName, string moduleName)
         {
-            var ctrl = GetController();
-            var task = FindTask(ctrl, taskName);
+            Exception liveErr;
+            try
+            {
+                using (var controller = ConnectToController())
+                {
+                    var task = controller.Rapid.GetTask(taskName ?? "T_ROB1");
+                    RapidData rd = null;
+                    string foundModule = null;
+                    try
+                    {
+                        if (!string.IsNullOrEmpty(moduleName))
+                        {
+                            rd = task.GetRapidData(moduleName, varName);
+                            foundModule = moduleName;
+                        }
+                        else
+                        {
+                            // Shared-module data resolves from the bare name; module-
+                            // scoped data needs its module, so search them all.
+                            try { rd = task.GetRapidData(varName); foundModule = "(shared)"; }
+                            catch { rd = null; }
+                            if (rd == null)
+                            {
+                                foreach (Module mod in task.GetModules())
+                                {
+                                    try { rd = task.GetRapidData(mod.Name, varName); }
+                                    catch { rd = null; }
+                                    if (rd != null) { foundModule = mod.Name; break; }
+                                }
+                            }
+                        }
 
-            foreach (RsDataDeclaration decl in task.DataDeclarations)
+                        if (rd == null)
+                            throw new Exception(
+                                $"RAPID data '{varName}' not found in task '{task.Name}'" +
+                                (string.IsNullOrEmpty(moduleName)
+                                    ? " (searched shared + all modules)"
+                                    : $" module '{moduleName}'"));
+
+                        return new
+                        {
+                            task = task.Name,
+                            module = foundModule,
+                            name = varName,
+                            dataType = rd.RapidType,
+                            isArray = rd.IsArray,
+                            isTaskPers = rd.IsTaskPers,
+                            isLocal = rd.IsLocal,
+                            value = rd.StringValue,
+                            source = "controller (live value)"
+                        };
+                    }
+                    finally
+                    {
+                        (rd as IDisposable)?.Dispose();
+                    }
+                }
+            }
+            catch (Exception ex) { liveErr = ex; }
+
+            // Fallback: the station-side declaration (pre-2.2.0 behavior).
+            var ctrl = GetController();
+            var rsTask = FindTask(ctrl, taskName);
+            foreach (RsDataDeclaration decl in rsTask.DataDeclarations)
             {
                 if (decl.Name.Equals(varName, StringComparison.OrdinalIgnoreCase))
                 {
@@ -570,7 +695,9 @@ namespace ClaudeBridge
                         ["dataType"] = decl.DataType,
                         ["moduleName"] = decl.ModuleName,
                         ["storageType"] = decl.StorageType.ToString(),
-                        ["local"] = decl.Local
+                        ["local"] = decl.Local,
+                        ["source"] = "station declaration (live read failed)",
+                        ["liveReadError"] = liveErr.Message
                     };
 
                     // Try to get InitialExpression (on RsGenericDataDeclaration)
@@ -580,7 +707,8 @@ namespace ClaudeBridge
                     return result;
                 }
             }
-            throw new Exception($"Variable '{varName}' not found in task '{taskName}'");
+            throw new Exception(
+                $"Variable '{varName}' not found in task '{taskName}'. Live read also failed: {liveErr.Message}");
         }
 
         private object SetRapidVariable(string taskName, string varName, string body)
@@ -829,66 +957,115 @@ namespace ClaudeBridge
 
         // â”€â”€ Position Endpoint â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
+        // Live joints + world-frame TCP for every mechanical unit of every station
+        // controller, via the PC SDK MotionDomain (MechanicalUnit.GetPosition).
+        // The pre-2.2.0 implementation walked STATION Mechanism objects and
+        // reflected for a "JointValues" property that does not exist on them (and
+        // a flange Matrix4 whose X/Y/Z it misread), so it returned zeros/[] for
+        // every mechanism since day one. MechanicalUnit.GetPosition() is the
+        // documented live-position API: the no-arg overload returns a JointTarget
+        // for ANY unit type (external axes included); the CoordinateSystemType
+        // overload returns a RobTarget but "supports mechanical unit type TCP
+        // Robot only", hence the Type gate before calling it.
         private object GetRobotPosition()
         {
             var station = GetActiveStation();
-            var mechanisms = new List<object>();
+            if (station.Irc5Controllers.Count == 0)
+                throw new Exception("No controller in station");
 
-            foreach (ProjectObject child in station.Children)
+            var scanner = new NetworkScanner();
+            scanner.Scan();
+
+            var controllers = new List<object>();
+            foreach (RsIrc5Controller rsCtrl in station.Irc5Controllers)
             {
-                if (child is Mechanism mech)
+                try
                 {
-                    // Get joint values
-                    var jointValues = new List<double>();
-                    try
+                    using (var controller = ConnectTo(rsCtrl, scanner))
                     {
-                        var jvProp = mech.GetType().GetProperty("JointValues");
-                        if (jvProp != null)
+                        var units = new List<object>();
+                        foreach (ABB.Robotics.Controllers.MotionDomain.MechanicalUnit mu
+                                 in controller.MotionSystem.MechanicalUnits)
                         {
-                            var jv = jvProp.GetValue(mech) as double[];
-                            if (jv != null) jointValues.AddRange(jv);
-                        }
-                    }
-                    catch { /* ignore */ }
+                            object joints = null, extJoints = null, tcp = null;
+                            string unitError = null;
+                            string taskName = null;
+                            try { taskName = mu.Task?.Name; } catch { }
 
-                    // Get flange transform via reflection
-                    double fx = 0, fy = 0, fz = 0;
-                    try
-                    {
-                        var flange = mech.GetFlange(0);
-                        var tProp = flange.GetType().GetProperty("Transform")
-                                 ?? flange.GetType().GetProperty("Matrix");
-                        if (tProp != null)
+                            try
+                            {
+                                var jt = mu.GetPosition();
+                                joints = new[]
+                                {
+                                    (double)jt.RobAx.Rax_1, (double)jt.RobAx.Rax_2,
+                                    (double)jt.RobAx.Rax_3, (double)jt.RobAx.Rax_4,
+                                    (double)jt.RobAx.Rax_5, (double)jt.RobAx.Rax_6
+                                };
+                                // External axes come back as 9E9 sentinels when absent
+                                // (the RAPID convention) -- passed through verbatim.
+                                extJoints = new[]
+                                {
+                                    (double)jt.ExtAx.Eax_a, (double)jt.ExtAx.Eax_b,
+                                    (double)jt.ExtAx.Eax_c, (double)jt.ExtAx.Eax_d,
+                                    (double)jt.ExtAx.Eax_e, (double)jt.ExtAx.Eax_f
+                                };
+                            }
+                            catch (Exception ex) { unitError = "joints: " + ex.Message; }
+
+                            if (mu.Type == ABB.Robotics.Controllers.MotionDomain.MechanicalUnitType.TcpRobot)
+                            {
+                                try
+                                {
+                                    var rt = mu.GetPosition(
+                                        ABB.Robotics.Controllers.MotionDomain.CoordinateSystemType.World);
+                                    tcp = new
+                                    {
+                                        x = (double)rt.Trans.X, y = (double)rt.Trans.Y,
+                                        z = (double)rt.Trans.Z,
+                                        q1 = rt.Rot.Q1, q2 = rt.Rot.Q2,
+                                        q3 = rt.Rot.Q3, q4 = rt.Rot.Q4
+                                    };
+                                }
+                                catch (Exception ex)
+                                {
+                                    unitError = (unitError == null ? "" : unitError + "; ")
+                                              + "tcp: " + ex.Message;
+                                }
+                            }
+
+                            units.Add(new
+                            {
+                                name = mu.Name,
+                                model = mu.Model,
+                                type = mu.Type.ToString(),
+                                axes = mu.NumberOfAxes,
+                                task = taskName,
+                                joints,
+                                extJoints,
+                                tcp,
+                                error = unitError
+                            });
+                        }
+                        controllers.Add(new
                         {
-                            var mat = tProp.GetValue(flange);
-                            fx = (double)(mat.GetType().GetProperty("X")?.GetValue(mat) ?? 0.0);
-                            fy = (double)(mat.GetType().GetProperty("Y")?.GetValue(mat) ?? 0.0);
-                            fz = (double)(mat.GetType().GetProperty("Z")?.GetValue(mat) ?? 0.0);
-                        }
+                            controller = rsCtrl.Name,
+                            state = rsCtrl.SystemState.ToString(),
+                            units
+                        });
                     }
-                    catch { /* ignore */ }
-
-                    mechanisms.Add(new
+                }
+                catch (Exception ex)
+                {
+                    // One unreachable/stopped controller must not hide the others.
+                    controllers.Add(new
                     {
-                        name = mech.Name,
-                        type = mech.GetType().Name,
-                        flangeX = fx, flangeY = fy, flangeZ = fz,
-                        joints = jointValues
+                        controller = rsCtrl.Name,
+                        state = rsCtrl.SystemState.ToString(),
+                        error = ex.Message
                     });
                 }
             }
-
-            // Fallback: MechanicalUnits from controller
-            if (mechanisms.Count == 0)
-            {
-                var ctrl = GetController();
-                foreach (RsMechanicalUnit mu in ctrl.MechanicalUnits)
-                {
-                    mechanisms.Add(new { name = mu.Name, type = mu.GetType().Name });
-                }
-            }
-
-            return mechanisms;
+            return controllers;
         }
 
         // â”€â”€ I/O Signal Endpoints â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€

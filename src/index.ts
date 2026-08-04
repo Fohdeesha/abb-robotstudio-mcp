@@ -156,7 +156,12 @@ async function rwsRaw(
 ): Promise<{ status: number; body: string }> {
   const url = `${RWS_URL}${path}`;
   const baseHeaders: Record<string, string> = { Accept: accept };
-  if (body && contentType) baseHeaders["Content-Type"] = contentType;
+  // NOTE body !== undefined, not truthiness: several RWS 2.0 POSTs take an
+  // EMPTY form body (resetpp, mastership request/release) but still demand the
+  // versioned form Content-Type -- an empty string is falsy, and the truthy
+  // check silently dropped the header, turning those calls into 406
+  // "Content type is not supported" rejections.
+  if (body !== undefined && contentType) baseHeaders["Content-Type"] = contentType;
 
   const attempt = async (extra: Record<string, string>) => {
     const headers: Record<string, string> = { ...baseHeaders, ...extra };
@@ -174,12 +179,22 @@ async function rwsRaw(
     return res;
   };
 
-  // Try any existing session cookie first; on 401, run the Digest handshake and retry.
+  // Try any existing session cookie first; on 401, answer whichever scheme the
+  // controller challenges with and retry. IRC5/RWS 1.0 challenges Digest;
+  // OmniCore/RWS 2.0 challenges BASIC and rejects Digest outright (measured on
+  // the RW7 VC 2026-08-04: WWW-Authenticate: Basic realm="validusers@robapi.abb"
+  // -- pre-fix, every rws_* call against an OmniCore died 401 here because only
+  // the Digest branch existed). Both generations then issue the same
+  // -http-session-/ABBCX cookie pair, so the shared jar covers both.
   let res = await attempt({});
   if (res.status === 401) {
     const www = res.headers.get("www-authenticate") || "";
     if (/digest/i.test(www)) {
       res = await attempt({ Authorization: buildDigestHeader(method, path, parseDigestChallenge(www)) });
+    } else if (/basic/i.test(www)) {
+      res = await attempt({
+        Authorization: "Basic " + Buffer.from(`${RWS_USER}:${RWS_PASS}`).toString("base64"),
+      });
     }
   }
   return { status: res.status, body: await res.text() };
@@ -199,7 +214,44 @@ async function rws(
     method = "GET"; path = methodOrPath; body = pathOrBody; contentType = bodyOrCt;
   }
   await ensureRwsReady();
+  // RWS 2.0 requires the VERSIONED media type on request bodies too --
+  // MEASURED on the RW7 VC 2026-08-04: a POST with a plain
+  // application/x-www-form-urlencoded Content-Type answers 406 whatever the
+  // Accept header says; ";v=2.0" on the Content-Type turns the same request
+  // into a 204. (Same convention the egm-bridge's own RWS client uses.)
+  if (rwsApiVersion === "v2" && contentType && !/;v=2\.0/.test(contentType)) {
+    contentType = `${contentType};v=2.0`;
+  }
   return rwsRaw(method, path, body, contentType, rwsAccept());
+}
+
+// Decode the few HTML entities RWS bodies carry in text spans (RWS 2.0 returns
+// e.g. &quot;v5.5.1&quot; for a RAPID string value).
+function rwsDecodeEntities(s: string): string {
+  return s
+    .replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&#39;/g, "'")
+    .replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&");
+}
+
+// Resolve a bare I/O signal name to its full Network/Device/Signal path via the
+// signal list (the li titles carry the full path on both generations). RWS 2.0
+// REJECTS bare names on reads outright ("Invalid IO signal name passed in the
+// uri", measured on the RW7 VC); RWS 1.0 accepts bare names on GET but requires
+// the full path on SET (measured on the RW6 VC 2026-07-16). Full paths pass
+// through untouched.
+async function rwsResolveSignalPath(signal: string): Promise<string> {
+  if (signal.includes("/")) return signal;
+  const r = await rws("/rw/iosystem/signals");
+  const re = /class="ios-signal-li" title="([^"]*)"/gi;
+  let m: RegExpExecArray | null;
+  const matches: string[] = [];
+  while ((m = re.exec(r.body)) !== null) {
+    const path = m[1];
+    const leaf = path.split("/").pop() ?? "";
+    if (leaf.toLowerCase() === signal.toLowerCase()) matches.push(path);
+  }
+  if (matches.length === 0) return signal; // let the controller report the error
+  return matches[0];
 }
 
 function rwsExtract(xml: string, tag: string): string {
@@ -284,10 +336,12 @@ server.tool("rs_write_module", "Write RAPID module source code into running cont
   } catch (e: any) { return err(e); } }
 );
 
-server.tool("rs_read_variable", "Read a RAPID variable initial value (SDK)",
-  { task: z.string(), name: z.string() },
-  async ({ task, name }) => { try {
-    return ok(await bridge(`/rapid/variable?task=${encodeURIComponent(task)}&name=${encodeURIComponent(name)}`));
+server.tool("rs_read_variable", "Read a RAPID variable's LIVE controller value (PC SDK; falls back to the station declaration if the controller is unreachable)",
+  { task: z.string(), name: z.string(),
+    module: z.string().optional().describe("Module name; omit to search shared data + all modules") },
+  async ({ task, name, module }) => { try {
+    const mod = module ? `&module=${encodeURIComponent(module)}` : "";
+    return ok(await bridge(`/rapid/variable?task=${encodeURIComponent(task)}&name=${encodeURIComponent(name)}${mod}`));
   } catch (e: any) { return err(e); } }
 );
 
@@ -409,7 +463,7 @@ server.tool("rs_check_collisions", "Run collision check on station objects", {},
   async () => { try { return ok(await bridge("/collision/check")); } catch (e: any) { return err(e); } }
 );
 
-server.tool("rs_get_position", "Get robot position via SDK", {},
+server.tool("rs_get_position", "Get live joints + world-frame TCP for every mechanical unit of every station controller (PC SDK)", {},
   async () => { try { return ok(await bridge("/robot/position")); } catch (e: any) { return err(e); } }
 );
 
@@ -425,8 +479,12 @@ server.tool("rs_get_io_signals", "List I/O signals via SDK", {},
 
 server.tool("rws_controller_status", "Get controller state via RWS (opmode, motors, RAPID execution)", {},
   async () => { try {
+    await ensureRwsReady();
+    // RWS 2.0 renamed /rw/panel/ctrlstate -> /rw/panel/ctrl-state (the span
+    // class stays "ctrlstate" on both generations).
+    const ctrlPath = rwsApiVersion === "v2" ? "/rw/panel/ctrl-state" : "/rw/panel/ctrlstate";
     const [panel, opmode, exec] = await Promise.all([
-      rws( "/rw/panel/ctrlstate"),
+      rws(ctrlPath),
       rws( "/rw/panel/opmode"),
       rws( "/rw/rapid/execution"),
     ]);
@@ -442,7 +500,13 @@ server.tool("rws_controller_status", "Get controller state via RWS (opmode, moto
 server.tool("rws_set_motors", "Turn motors on/off via RWS (real controller command)",
   { state: z.enum(["on", "off"]) },
   async ({ state }) => { try {
-    const r = await rws("POST","/rw/panel/ctrlstate?action=setctrlstate",
+    await ensureRwsReady();
+    // v2 (OmniCore): POST /rw/panel/ctrl-state with the same body, NO ?action
+    // selector -- the egm-bridge's proven form (204 + live transition on RW7).
+    const path = rwsApiVersion === "v2"
+      ? "/rw/panel/ctrl-state"
+      : "/rw/panel/ctrlstate?action=setctrlstate";
+    const r = await rws("POST", path,
       `ctrl-state=motor${state}`, "application/x-www-form-urlencoded");
     return ok({ result: rwsOk(r.status) ? `Motors ${state}` : r.body });
   } catch (e: any) { return err(e); } }
@@ -450,10 +514,18 @@ server.tool("rws_set_motors", "Turn motors on/off via RWS (real controller comma
 
 // ── RAPID Execution ──────────────────────────────────────────
 
+// v2 (OmniCore) execution actions are path segments with implicit mastership
+// (?mastership=implicit) instead of v1's ?action= query -- the egm-bridge's
+// proven forms, exercised against the RW7 VC on every bridge startup.
+
 server.tool("rws_start_program", "Start RAPID execution on the controller via RWS",
   { mode: z.enum(["continue", "reset"]).optional() },
   async ({ mode }) => { try {
-    const r = await rws("POST","/rw/rapid/execution?action=start",
+    await ensureRwsReady();
+    const path = rwsApiVersion === "v2"
+      ? "/rw/rapid/execution/start?mastership=implicit"
+      : "/rw/rapid/execution?action=start";
+    const r = await rws("POST", path,
       `regain=continue&execmode=${mode || "continue"}&cycle=forever&condition=none&stopatbp=disabled&alltaskbytsp=false`,
       "application/x-www-form-urlencoded");
     return ok({ result: rwsOk(r.status) ? "Program started" : r.body });
@@ -462,7 +534,11 @@ server.tool("rws_start_program", "Start RAPID execution on the controller via RW
 
 server.tool("rws_stop_program", "Stop RAPID execution via RWS", {},
   async () => { try {
-    const r = await rws("POST","/rw/rapid/execution?action=stop",
+    await ensureRwsReady();
+    const path = rwsApiVersion === "v2"
+      ? "/rw/rapid/execution/stop"
+      : "/rw/rapid/execution?action=stop";
+    const r = await rws("POST", path,
       "stopmode=stop&usetsp=normal", "application/x-www-form-urlencoded");
     return ok({ result: rwsOk(r.status) ? "Program stopped" : r.body });
   } catch (e: any) { return err(e); } }
@@ -470,7 +546,11 @@ server.tool("rws_stop_program", "Stop RAPID execution via RWS", {},
 
 server.tool("rws_reset_pp", "Reset RAPID program pointer via RWS", {},
   async () => { try {
-    const r = await rws("POST","/rw/rapid/execution?action=resetpp");
+    await ensureRwsReady();
+    const path = rwsApiVersion === "v2"
+      ? "/rw/rapid/execution/resetpp?mastership=implicit"
+      : "/rw/rapid/execution?action=resetpp";
+    const r = await rws("POST", path, "", "application/x-www-form-urlencoded");
     return ok({ result: rwsOk(r.status) ? "PP reset" : r.body });
   } catch (e: any) { return err(e); } }
 );
@@ -496,32 +576,107 @@ server.tool("rws_get_tasks", "List RAPID tasks via RWS", {},
 server.tool("rws_get_modules", "List RAPID modules in a task via RWS",
   { task: z.string() },
   async ({ task }) => { try {
-    const r = await rws( `/rw/rapid/tasks/${task}/modules`);
+    await ensureRwsReady();
+    // MEASURED on both live VCs (2026-08-04): RWS 1.0 (IRC5/RW6) serves the
+    // module list at /rw/rapid/modules?task=<task> and answers "Resource not
+    // found" (-1073414146) on the tasks/{task}/modules form; RWS 2.0
+    // (OmniCore/RW7) is the exact inverse. Same rap-module-info-li shape
+    // (name/type spans) either way -- only the path differs.
+    const path = rwsApiVersion === "v2"
+      ? `/rw/rapid/tasks/${encodeURIComponent(task)}/modules`
+      : `/rw/rapid/modules?task=${encodeURIComponent(task)}`;
+    const r = await rws(path);
     const names = rwsExtractAll(r.body, "name");
     const types = rwsExtractAll(r.body, "type");
     return ok(names.map((n, i) => ({ name: n, type: types[i] ?? "?" })));
   } catch (e: any) { return err(e); } }
 );
 
+// Fetch a module's full source text. The docs show inline
+// <span class="module-text">; the real firmware on BOTH VC generations
+// (measured 2026-08-04) instead returns a <span class="file-path"> pointing at
+// a temp file the controller wrote -- a controller-fs path on OmniCore
+// (fetchable via /fileservice), a HOST path on the RW6 VC (readable only on
+// the RobotStudio machine; the SDK tool rs_read_module is the reliable reader
+// elsewhere). Throws with a useful message on failure.
+async function rwsFetchModuleText(task: string, module: string): Promise<{ text: string; source: string }> {
+  const path = rwsApiVersion === "v2"
+    ? `/rw/rapid/tasks/${task}/modules/${module}/text`
+    : `/rw/rapid/modules/${module}?resource=module-text&task=${encodeURIComponent(task)}`;
+  const r = await rws(path);
+  const inline = rwsExtract(r.body, "module-text");
+  if (inline) return { text: rwsDecodeEntities(inline), source: "inline" };
+  const fp = rwsDecodeEntities(rwsExtract(r.body, "file-path")).replace(/^"|"$/g, "");
+  if (fp) {
+    if (/^[A-Za-z]:[\\/]/.test(fp)) {
+      try {
+        const { readFileSync } = await import("node:fs");
+        return { text: readFileSync(fp, "utf8"), source: "vc-host-file" };
+      } catch (e: any) {
+        throw new Error(`module text is at a VC host path (${fp}) this process cannot read: ${e.message}. Use rs_read_module instead.`);
+      }
+    }
+    const f = await rws(`/fileservice/${fp.replace(/^\//, "")}`);
+    if (rwsOk(f.status)) return { text: f.body, source: "fileservice" };
+    throw new Error(`module text temp file fetch failed (${f.status}) at ${fp}. Use rs_read_module instead.`);
+  }
+  throw new Error(`no module text in response (${r.status}): ${r.body.slice(0, 200)}`);
+}
+
 server.tool("rws_read_module", "Read RAPID module text via RWS",
   { task: z.string(), module: z.string() },
   async ({ task, module }) => { try {
-    const r = await rws( `/rw/rapid/tasks/${task}/modules/${module}/text`);
-    const text = rwsExtract(r.body, "module-text") || r.body;
-    return ok({ task, module, text });
+    await ensureRwsReady();
+    const { text, source } = await rwsFetchModuleText(task, module);
+    return ok({ task, module, text, source });
   } catch (e: any) { return err(e); } }
 );
 
-server.tool("rws_write_module", "Write RAPID module text via RWS (auto-mastership)",
+server.tool("rws_write_module",
+  "Write RAPID module text via RWS (auto-mastership; VERIFIES the stored text afterwards -- the RWS form endpoint silently truncates large modules, so prefer rs_write_module for anything big)",
   { task: z.string(), module: z.string(), code: z.string() },
   async ({ task, module, code }) => { try {
-    await rws("POST","/rw/mastership/rapid?action=request");
+    await ensureRwsReady();
+    let wr: { status: number; body: string };
+    if (rwsApiVersion === "v2") {
+      const mr = await rws("POST", "/rw/mastership/edit/request", "", "application/x-www-form-urlencoded");
+      if (!rwsOk(mr.status)) return ok({ result: `edit mastership refused (${mr.status}): ${mr.body}` });
+      try {
+        wr = await rws("POST",
+          `/rw/rapid/tasks/${task}/modules/${module}/text?action=set`,
+          `module-text=${encodeURIComponent(code)}`, "application/x-www-form-urlencoded");
+      } finally {
+        await rws("POST", "/rw/mastership/edit/release", "", "application/x-www-form-urlencoded").catch(() => {});
+      }
+    } else {
+      // v1 form per the RWS 1.0 manual: POST /rw/rapid/modules/{module}
+      // ?task=...&action=set-module-text with body field "text".
+      await rws("POST","/rw/mastership/rapid?action=request");
+      try {
+        wr = await rws("POST",
+          `/rw/rapid/modules/${module}?task=${encodeURIComponent(task)}&action=set-module-text`,
+          `text=${encodeURIComponent(code)}`, "application/x-www-form-urlencoded");
+      } finally { await rws("POST","/rw/mastership/rapid?action=release").catch(() => {}); }
+    }
+    if (!rwsOk(wr.status)) return ok({ result: wr.body });
+    // MANDATORY post-write verification. MEASURED on the RW6 VC 2026-08-04:
+    // set-module-text answered 2xx for a 30 KB module but STORED only ~5 KB --
+    // the loaded program lost PROC main and every later symbol, silently.
+    // (Recovered via loadprog from the deployed .pgf.) A write this endpoint
+    // truncates must be reported as the program-corrupting failure it is.
+    const norm = (s: string) => s.replace(/\r\n/g, "\n").trimEnd();
     try {
-      const r = await rws("POST",
-        `/rw/rapid/tasks/${task}/modules/${module}/text?action=set`,
-        `module-text=${encodeURIComponent(code)}`, "application/x-www-form-urlencoded");
-      return ok({ result: rwsOk(r.status) ? `Module ${module} updated` : r.body });
-    } finally { await rws("POST","/rw/mastership/rapid?action=release").catch(() => {}); }
+      const back = await rwsFetchModuleText(task, module);
+      if (norm(back.text) !== norm(code)) {
+        return err(
+          `WRITE CORRUPTED THE MODULE: controller stored ${back.text.length} chars of the ${code.length} sent ` +
+          `(the RWS form endpoint truncates large modules). The loaded program is now BROKEN -- reload it ` +
+          `(loadprog from its .pgf / restart the bridge) and use rs_write_module for large modules.`);
+      }
+      return ok({ result: `Module ${module} updated and verified (${code.length} chars)` });
+    } catch (e: any) {
+      return ok({ result: `Module ${module} updated, but verification read failed: ${e.message}` });
+    }
   } catch (e: any) { return err(e); } }
 );
 
@@ -530,18 +685,43 @@ server.tool("rws_write_module", "Write RAPID module text via RWS (auto-mastershi
 server.tool("rws_read_variable", "Read a RAPID variable's live runtime value via RWS",
   { task: z.string(), module: z.string(), variable: z.string() },
   async ({ task, module, variable }) => { try {
-    const r = await rws( `/rw/rapid/symbol/RAPID/${task}/${module}/${variable}/data`);
-    return ok({ variable, value: rwsExtract(r.body, "value") || r.body });
+    await ensureRwsReady();
+    // v1: /rw/rapid/symbol/data/RAPID/... (measured on the RW6 VC; the
+    // pre-fix v2-flavored path answered "Resource not found" there).
+    // v2: /rw/rapid/symbol/RAPID/.../data (measured on the RW7 VC).
+    const path = rwsApiVersion === "v2"
+      ? `/rw/rapid/symbol/RAPID/${task}/${module}/${variable}/data`
+      : `/rw/rapid/symbol/data/RAPID/${task}/${module}/${variable}`;
+    const r = await rws(path);
+    const v = rwsExtract(r.body, "value");
+    return ok({ variable, value: v ? rwsDecodeEntities(v) : r.body });
   } catch (e: any) { return err(e); } }
 );
 
-server.tool("rws_write_variable", "Write a RAPID variable's live value via RWS",
+server.tool("rws_write_variable", "Write a RAPID variable's live value via RWS (auto-mastership)",
   { task: z.string(), module: z.string(), variable: z.string(), value: z.string() },
   async ({ task, module, variable, value }) => { try {
+    await ensureRwsReady();
+    if (rwsApiVersion === "v2") {
+      // OmniCore: edit-domain mastership (subresource form; the v1 "rapid"
+      // domain 404s on RW7) held across the write in THIS session. A failed
+      // request is surfaced -- proceeding without it just yields the opaque
+      // -4501 "without required master ship" on the write itself.
+      const mr = await rws("POST", "/rw/mastership/edit/request", "", "application/x-www-form-urlencoded");
+      if (!rwsOk(mr.status)) return ok({ result: `edit mastership refused (${mr.status}): ${mr.body}` });
+      try {
+        const r = await rws("POST",
+          `/rw/rapid/symbol/RAPID/${task}/${module}/${variable}/data?action=set`,
+          `value=${encodeURIComponent(value)}`, "application/x-www-form-urlencoded");
+        return ok({ result: rwsOk(r.status) ? `${variable} = ${value}` : r.body });
+      } finally {
+        await rws("POST", "/rw/mastership/edit/release", "", "application/x-www-form-urlencoded").catch(() => {});
+      }
+    }
     await rws("POST","/rw/mastership/rapid?action=request");
     try {
       const r = await rws("POST",
-        `/rw/rapid/symbol/RAPID/${task}/${module}/${variable}/data?action=set`,
+        `/rw/rapid/symbol/data/RAPID/${task}/${module}/${variable}?action=set`,
         `value=${encodeURIComponent(value)}`, "application/x-www-form-urlencoded");
       return ok({ result: rwsOk(r.status) ? `${variable} = ${value}` : r.body });
     } finally { await rws("POST","/rw/mastership/rapid?action=release").catch(() => {}); }
@@ -571,35 +751,44 @@ server.tool("rws_get_position", "Get live robot TCP position via RWS",
 
 // ── I/O Signals (RWS — live) ────────────────────────────────
 
-server.tool("rws_get_io_signals", "List all I/O signals via RWS", {},
+server.tool("rws_get_io_signals", "List all I/O signals via RWS (path = the full Network/Device/Signal form writes require)", {},
   async () => { try {
     const r = await rws( "/rw/iosystem/signals");
+    const paths = [...r.body.matchAll(/class="ios-signal-li" title="([^"]*)"/gi)].map(m => m[1]);
     const names = rwsExtractAll(r.body, "name");
     const types = rwsExtractAll(r.body, "type");
     const vals = rwsExtractAll(r.body, "lvalue");
-    return ok(names.map((n, i) => ({ name: n, type: types[i], value: vals[i] })));
+    return ok(names.map((n, i) => ({ name: n, type: types[i], value: vals[i], path: paths[i] })));
   } catch (e: any) { return err(e); } }
 );
 
-server.tool("rws_read_io", "Read a single I/O signal via RWS",
-  { signal: z.string() },
+server.tool("rws_read_io", "Read a single I/O signal via RWS (bare names are auto-resolved to their full path)",
+  { signal: z.string().describe("Signal name or full Network/Device/Signal path") },
   async ({ signal }) => { try {
-    const r = await rws( `/rw/iosystem/signals/${signal}`);
-    return ok({ signal, type: rwsExtract(r.body, "type"), value: rwsExtract(r.body, "lvalue") });
+    await ensureRwsReady();
+    // RWS 2.0 rejects bare signal names on GET ("Invalid IO signal name passed
+    // in the uri", measured on the RW7 VC) -- resolve via the signal list.
+    // RWS 1.0 accepts bare names on GET, so only v2 needs the resolution.
+    const sig = rwsApiVersion === "v2" ? await rwsResolveSignalPath(signal) : signal;
+    const r = await rws( `/rw/iosystem/signals/${sig}`);
+    return ok({ signal: sig, type: rwsExtract(r.body, "type"), value: rwsExtract(r.body, "lvalue") });
   } catch (e: any) { return err(e); } }
 );
 
-server.tool("rws_write_io", "Set an I/O signal value via RWS",
-  { signal: z.string(), value: z.number() },
+server.tool("rws_write_io", "Set an I/O signal value via RWS (bare names are auto-resolved to their full path)",
+  { signal: z.string().describe("Signal name or full Network/Device/Signal path"), value: z.number() },
   async ({ signal, value }) => { try {
     await ensureRwsReady();
-    // v1/IRC5: "?action=set"; v2/OmniCore: "/set-value". Accept header (carried
-    // by rws()) selects the API version; the endpoint PATH differs too.
+    // BOTH generations require the full Network/Device/Signal path on writes
+    // (v1 measured 2026-07-16: bare-name SET rejected -1073445881 while
+    // full-path succeeded; v2 rejects bare names on any access) -- resolve.
+    // v1/IRC5: "?action=set"; v2/OmniCore: "/set-value".
+    const sig = await rwsResolveSignalPath(signal);
     const path = rwsApiVersion === "v2"
-      ? `/rw/iosystem/signals/${signal}/set-value`
-      : `/rw/iosystem/signals/${signal}?action=set`;
+      ? `/rw/iosystem/signals/${sig}/set-value`
+      : `/rw/iosystem/signals/${sig}?action=set`;
     const r = await rws("POST", path, `lvalue=${value}`, "application/x-www-form-urlencoded");
-    return ok({ result: rwsOk(r.status) ? `${signal} = ${value}` : r.body });
+    return ok({ result: rwsOk(r.status) ? `${sig} = ${value}` : r.body });
   } catch (e: any) { return err(e); } }
 );
 
@@ -623,21 +812,39 @@ server.tool("rws_set_speed_override", "Set speed override (0-100%) via RWS",
 
 // ── Event Log (RWS) ─────────────────────────────────────────
 
-server.tool("rws_event_log", "Get controller event log via RWS",
-  { count: z.number().optional().describe("Default: 10") },
-  async ({ count }) => { try {
-    const r = await rws( `/rw/elog/0?lang=en&count=${count || 10}`);
-    return ok({ log: r.body });
+server.tool("rws_event_log", "Get controller event log via RWS (structured; newest first)",
+  { count: z.number().optional().describe("Max entries to return (default 10)"),
+    domain: z.number().optional().describe("Elog domain (default 0 = common)") },
+  async ({ count, domain }) => { try {
+    // Same elog-message-li shape on both generations (measured 2026-08-04).
+    // ?lang=en is what makes title/desc appear at all.
+    const r = await rws( `/rw/elog/${domain ?? 0}?lang=en`);
+    const entries = [...r.body.matchAll(
+      /<li class="elog-message-li" title="([^"]*)">([\s\S]*?)<\/li>/gi
+    )].map((m) => {
+      const seq = m[1].split("/").pop() ?? "";
+      const block = m[2];
+      const f = (cls: string) => {
+        const mm = block.match(new RegExp(`class="${cls}"[^>]*>([^<]*)<`, "i"));
+        return rwsDecodeEntities((mm?.[1] ?? "").trim());
+      };
+      return { seqnum: seq, msgtype: f("msgtype"), code: f("code"),
+               tstamp: f("tstamp"), title: f("title"), desc: f("desc") };
+    });
+    return ok(entries.slice(0, count || 10));
   } catch (e: any) { return err(e); } }
 );
 
 // ── Controller Files (RWS) ──────────────────────────────────
 
-server.tool("rws_list_files", "List files on controller filesystem via RWS",
+server.tool("rws_list_files", "List files on controller filesystem via RWS (structured)",
   { path: z.string().optional().describe("Default: $HOME") },
   async ({ path }) => { try {
     const r = await rws( `/fileservice/${encodeURIComponent(path || "$HOME")}`);
-    return ok({ files: r.body });
+    // fs-dir / fs-file li titles carry the names on both generations.
+    const dirs  = [...r.body.matchAll(/<li class="fs-dir" title="([^"]*)"/gi)].map(m => m[1]);
+    const files = [...r.body.matchAll(/<li class="fs-file" title="([^"]*)"/gi)].map(m => m[1]);
+    return ok({ path: path || "$HOME", dirs, files });
   } catch (e: any) { return err(e); } }
 );
 
@@ -658,25 +865,41 @@ server.tool("rws_write_file", "Write a file to controller filesystem via RWS",
 );
 
 // ── Mastership (RWS) ────────────────────────────────────────
-// NOTE: these use the RWS 1.0 domain paths (/rw/mastership/{rapid,cfg,motion}),
-// verified against IRC5. OmniCore/RWS 2.0 reworked mastership (e.g. an "edit"
-// mastership model); the v2 forms are UNVERIFIED here (no OmniCore hardware to
-// test against), so on an OmniCore controller mastership-gated writes may need
-// path updates. Left as-is rather than changed blind.
+// v1 (IRC5): domains {rapid, cfg, motion}, POST /rw/mastership/{d}?action=...
+// v2 (OmniCore, MEASURED on the RW7 VC 2026-08-04): domains {edit, motion}
+// with subresource forms POST /rw/mastership/{d}/{request|release} ("rapid"
+// 404s; the v1 write domain maps to "edit"). Mastership is SESSION-bound on
+// both generations -- request and release must ride the same session cookie,
+// which this server's shared jar guarantees (a request whose session dies
+// strands the hold until the controller's session timeout reaps it).
 
-server.tool("rws_request_mastership", "Request mastership (needed for writes)",
-  { domain: z.enum(["rapid", "cfg", "motion"]).optional() },
+function mapMastershipDomain(domain: string | undefined): string {
+  const d = domain || "rapid";
+  if (rwsApiVersion === "v2") return d === "rapid" || d === "cfg" ? "edit" : d;
+  return d;
+}
+
+server.tool("rws_request_mastership", "Request mastership (needed for writes; on OmniCore 'rapid'/'cfg' map to the v2 'edit' domain)",
+  { domain: z.enum(["rapid", "cfg", "motion", "edit"]).optional() },
   async ({ domain }) => { try {
-    const r = await rws("POST",`/rw/mastership/${domain || "rapid"}?action=request`);
-    return ok({ result: rwsOk(r.status) ? "Mastership acquired" : r.body });
+    await ensureRwsReady();
+    const d = mapMastershipDomain(domain);
+    const r = rwsApiVersion === "v2"
+      ? await rws("POST", `/rw/mastership/${d}/request`, "", "application/x-www-form-urlencoded")
+      : await rws("POST", `/rw/mastership/${d}?action=request`);
+    return ok({ result: rwsOk(r.status) ? `Mastership acquired (${d})` : r.body });
   } catch (e: any) { return err(e); } }
 );
 
 server.tool("rws_release_mastership", "Release mastership",
-  { domain: z.enum(["rapid", "cfg", "motion"]).optional() },
+  { domain: z.enum(["rapid", "cfg", "motion", "edit"]).optional() },
   async ({ domain }) => { try {
-    const r = await rws("POST",`/rw/mastership/${domain || "rapid"}?action=release`);
-    return ok({ result: rwsOk(r.status) ? "Mastership released" : r.body });
+    await ensureRwsReady();
+    const d = mapMastershipDomain(domain);
+    const r = rwsApiVersion === "v2"
+      ? await rws("POST", `/rw/mastership/${d}/release`, "", "application/x-www-form-urlencoded")
+      : await rws("POST", `/rw/mastership/${d}?action=release`);
+    return ok({ result: rwsOk(r.status) ? `Mastership released (${d})` : r.body });
   } catch (e: any) { return err(e); } }
 );
 
